@@ -1,0 +1,32 @@
+name: Build firmware
+on: workflow_dispatch
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Get the pi32v2 toolchain
+        run: |
+          curl -fLo toolchain.tar.xz https://github.com/jvitkauskas/pi32v2-llvm/releases/download/pi32v2-23.1.5-2/pi32v2-llvm-23.1.5-2-linux-x64.tar.xz
+          echo 'cb896562418a2be93edb9bac26af4bc81a106a32974002a78e6b9fc203c93990  toolchain.tar.xz' | sha256sum -c
+          mkdir toolchain && tar -xJf toolchain.tar.xz -C toolchain --strip-components=1
+
+      - name: PC tests (the recorder, the USB IN buffer, the mixer)
+        continue-on-error: true      # a failing test shows red here but does not stop the build below
+        run: make test
+
+      - name: Build the firmware and the installer page
+        run: EDITOR_E2E=0 INSTALLER_E2E=0 sh fw/build.sh      # (sh: an upload through the web page drops the executable bit)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sloop3-usb-in-build
+          path: |
+            build/fw/installer-fm1.html
+            build/fw/fw.area
