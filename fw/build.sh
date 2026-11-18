@@ -11,7 +11,7 @@ done
 # the interface and the projects: small rather than fast (they run between audio blocks, with time to spare); the
 # master bus too (its loops run once a block, on the mix: not per voice); the hardware's drivers
 for f in engine/drumkits.c engine/fm6_patches.c engine/slice.c hal/fm1/irq.c hal/fm1/board.c hal/fm1/cpu1.c hal/fm1/adc.c hal/fm1/panel.c hal/fm1/flash.c hal/fm1/usb.c hal/fm1/uart.c hal/fm1/sys.c \
-         engine/master.c seq/seq.c app/store.c app/harmony.c app/arp.c app/midi.c app/psound.c fw/main.c; do
+         engine/master.c seq/seq.c app/store.c app/harmony.c app/arp.c app/midi.c app/psound.c app/usbin.c app/usbrec.c fw/main.c; do
   "$TC/clang" $(echo "$CF" | sed 's/-O2/-Os/') -c $f -o $O/o/$(basename $f .c).o
 done
 # what runs seldom, or once a screen: the smallest (3.1.6: the room for the visualiser)
@@ -45,13 +45,13 @@ import struct; b=open('$O/ram.bin','rb').read(); b+=bytes(-len(b)%4); print(hex(
 "$TC/clang" -mcpu=ac791n ${BOOT_DIAG:+-DBOOT_DIAG} -DPACKED -DPAYLOAD="\"$O/ram.pk\"" -DXCODE="\"$O/xcode.bin\"" -c fw/xip.S -o $O/xip.o
 "$TC/ld.lld" -T fw/xip.ld -o $O/app.elf $O/xip.o $O/unpack.o
 "$TC/llvm-objcopy" -O binary $O/app.elf $O/app.bin
-# the area: the firmware, then the sample bank at flash 0x48800 (4.0.2) (assets/samples.bin, tools/mksamples.py); the projects
+# the area: the firmware, then the sample bank at flash 0x48000 (assets/samples.bin, tools/mksamples.py); the projects
 # begin at 0x7A000 (app/store.h): the area, from 0x4000, must end before
 python3 tools/mkfw.py $O/app.bin $O/fw.area assets/samples.bin
-test $(wc -c < $O/fw.area) -le $((0x78000 - 0x4000)) || { echo "the area would run into your FM6 bank and SYN kits (0x78000, app/xbank.h)"; exit 1; }
+test $(stat -c%s $O/fw.area) -le $((0x78000 - 0x4000)) || { echo "the area would run into your FM6 bank and SYN kits (0x78000, app/xbank.h)"; exit 1; }
 "$TC/llvm-size" $O/ram.elf | tail -1
 # the installer page: through m-bootloader's MIDI MODE only (3.3.1: the way straight from SLOOP 2.8 is gone)
-python3 tools/mkpage.py $O/fw.area "3.4.0" $O/installer-fm1.html
+python3 tools/mkpage.py $O/fw.area "3.3.7" $O/installer-fm1.html
 python3 tools/mkeditor.py web/editor.html > /dev/null
 cp web/editor.html $O/editor-sloop3.html
 # the page against a simulated m-bootloader: the package it serves, decrypted, is fw.area (tests/install_sim.js)

@@ -10,11 +10,16 @@
  * and count registers, isochronous by TXCSR2 bit 6), so a computer records the FM-1 over the cable. The audio is
  * ours (usb_audio_put, a block at a time) through a ring the port drains: a packet each millisecond, 44 or 45
  * frames (the 44.1 kHz pattern) or 48, one more or one fewer while the ring's low point leaves its band (our clock
- * and the host's differ a little). The port is served from the 2 kHz tick (irq.c): usb_tick. */
+ * and the host's differ a little). The port is served from the 2 kHz tick (irq.c): usb_tick.
+ * And a USB audio output (the other way: a computer or a phone plays to the FM-1, USB AUDIO IN): 16-bit stereo at 44.1 or
+ * 48 kHz on an isochronous OUT endpoint (endpoint 2, interface 3), its packets handed to app/usbin.c, which brings them to
+ * the engine's rate. The controller's endpoint 2 is set up as endpoint 1 is, isochronous by RXCSR2 bit 6, as endpoint 4 is
+ * for its transmit: UNTESTED ON HARDWARE (the register facts are those of the other endpoints here; see docs/USB-IN.md). */
 #include "usb.h"
 #include "fm1.h"
 #include "board.h"
 #include "irq.h"
+#include "../../app/usbin.h"
 
 #define U_CON0        REG32(0x11800u)        /* bit 2: the SIE clocked; bit 13 a frame start pending, bit 12 acks it */
 #define U_CON1        REG32(0x11804u)        /* an SIE access: register << 8 | value, bit 14 read, bit 15 done */
@@ -71,17 +76,19 @@ static const char NAME[] = "SLOOP 3 Update";
 #else
 static const uint8_t DEV[18] = {
     18, 1, 0x10, 0x01, 0, 0, 0, PKT, 0x09, 0x12, 0x01, 0x00,     /* USB 1.1; vendor 0x1209 (pid.codes), product 0x0001 */
-    0x10, 0x03, 0, 1, 0, 1 };                                    /* device 3.10 (with the audio input: a host that
-                                                                  * kept 3.00's descriptors asks again); name: string 1 */
-#define CONF_LEN 178
+    0x20, 0x03, 0, 1, 0, 1 };                                    /* device 3.20 (with the audio output too: a host that
+                                                                  * kept 3.10's descriptors asks again); name: string 1 */
+#define CONF_LEN 255
 static const uint8_t CONF[CONF_LEN] = {
-    9, 2, CONF_LEN, 0, 3, 1, 0, 0x80, 50,                        /* 3 interfaces, bus powered, 100 mA */
+    9, 2, CONF_LEN, 0, 4, 1, 0, 0x80, 50,                        /* 4 interfaces, bus powered, 100 mA */
     9, 4, 0, 0, 0, 1, 1, 0, 0,                                   /* audio control */
-    10, 0x24, 1, 0x00, 0x01, 31, 0, 2, 2, 1,                     /*   its header: the audio stream (2) first, then the
-                                                                  *   MIDI one (1): a host that drops MIDI from the
+    11, 0x24, 1, 0x00, 0x01, 53, 0, 3, 2, 3, 1,                  /*   its header: the audio streams (2: in, 3: out) first, then
+                                                                  *   the MIDI one (1): a host that drops MIDI from the
                                                                   *   list still finds the audio */
     12, 0x24, 2, 1, 0x03, 0x06, 0, 2, 0x03, 0x00, 0, 0,          /*   input terminal 1: a line, 2 channels (L R) */
     9, 0x24, 3, 2, 0x01, 0x01, 0, 1, 0,                          /*   output terminal 2: the USB stream, from 1 */
+    12, 0x24, 2, 3, 0x01, 0x01, 0, 2, 0x03, 0x00, 0, 0,          /*   input terminal 3: the USB stream from the host, 2 channels (L R) */
+    9, 0x24, 3, 4, 0x01, 0x03, 0, 3, 0,                          /*   output terminal 4: a speaker, from 3 */
     9, 4, 1, 0, 2, 1, 3, 0, 0,                                   /* MIDI streaming, 2 endpoints */
     7, 0x24, 1, 0x00, 0x01, 65, 0,                               /*   its header */
     6, 0x24, 2, 1, 1, 0,                                         /*   IN jack 1, embedded (from the host) */
@@ -97,6 +104,12 @@ static const uint8_t CONF[CONF_LEN] = {
     7, 0x24, 1, 2, 1, 0x01, 0x00,                                /*   from terminal 2, a frame's delay, PCM */
     14, 0x24, 2, 1, 2, 2, 16, 2, 0x44, 0xAC, 0x00, 0x80, 0xBB, 0x00,   /* type I: 2 channels, 16 bits, 44100 or 48000 */
     9, 5, 0x84, 0x05, UA_MAXF * 4u, 0, 1, 0, 0,                  /*   endpoint 4 IN, isochronous, asynchronous, 1 ms */
+    7, 0x25, 1, 0x01, 0, 0, 0,                                   /*   its rate can be set */
+    9, 4, 3, 0, 0, 1, 2, 0, 0,                                   /* audio streaming (out), alternate 0: nothing */
+    9, 4, 3, 1, 1, 1, 2, 0, 0,                                   /*   alternate 1: the stream */
+    7, 0x24, 1, 3, 1, 0x01, 0x00,                                /*   to terminal 3, a frame's delay, PCM */
+    14, 0x24, 2, 1, 2, 2, 16, 2, 0x44, 0xAC, 0x00, 0x80, 0xBB, 0x00,   /* type I: 2 channels, 16 bits, 44100 or 48000 */
+    9, 5, 0x02, 0x09, UA_MAXF * 4u, 0, 1, 0, 0,                  /*   endpoint 2 OUT, isochronous, adaptive, 1 ms */
     7, 0x25, 1, 0x01, 0, 0, 0 };                                 /*   its rate can be set */
 _Static_assert(sizeof CONF == CONF_LEN, "the configuration's length");
 static const uint8_t LANG[4] = { 4, 3, 0x09, 0x04 };
@@ -119,6 +132,9 @@ static uint8_t addr, conf, open_, addr_pending, e0_sending, e0_zlp, rx_pend, tic
 static uint32_t ua_ring[UA_N];
 static volatile uint32_t ua_w, ua_r;
 static uint8_t ep4_in[UA_MAXF * 4u] __attribute__((aligned(4)));
+/* ---- the audio output (USB AUDIO IN): packets from the host, handed to app/usbin.c */
+static uint8_t ep2_out[UA_MAXF * 4u + 8u] __attribute__((aligned(4)));   /* (the controller's DMA writes a little past a packet) */
+static struct { volatile uint8_t alt; uint8_t r48, e0_ep; } uo;      /* streaming; the host's rate (SET_CUR); which endpoint's rate is coming */
 static struct {
     volatile uint8_t alt, r48, feed, go;             /* streaming; 48 kHz; the host reads; the ring primed */
     uint8_t e0_rx, queued, wait, force;              /* SET_CUR's data to come; a packet out; ms it waits; USB RATE */
@@ -206,6 +222,15 @@ static void ep4_setup(void)
     sie_wr(S_TX_CSR1, 0); sie_wr(S_TX_CSR2, 0x40);      /* isochronous */
     U_CON0 &= ~(1u << (19 + 4));
 }
+static void ep2_setup(void)                          /* the audio output: endpoint 2, receiving, isochronous */
+{
+    U_EP_RADR(2) = (uint32_t)(uintptr_t)ep2_out;
+    sie_wr(S_INDEX, 2);
+    sie_wr(S_RX_MAX, 0xFF);
+    sie_wr(S_RX_CSR1, 0x90); sie_wr(S_RX_CSR2, 0x40);   /* the data toggle cleared, emptied; isochronous (as endpoint 4's TXCSR2 bit 6) */
+    sie_wr(S_INT_RX1E, 0x06);                           /* endpoints 1 and 2 (after ep1_setup's 0x02) */
+    U_CON0 &= ~(1u << (19 + 2));
+}
 static const uint8_t *descriptor(uint32_t value, uint32_t *n)
 {
     switch (value >> 8) {
@@ -235,7 +260,11 @@ static void e0_service(void)
     __asm__ volatile("ssync" ::: "memory");
     if (ua.e0_rx) {                                                          /* SET_CUR's 3 bytes: Hz */
         ua.e0_rx = 0;
-        if (sie_rd(S_COUNT0) >= 3u) ua_rate((uint32_t)ep0[0] | (uint32_t)ep0[1] << 8 | (uint32_t)ep0[2] << 16);
+        if (sie_rd(S_COUNT0) >= 3u) {
+            uint32_t hz = (uint32_t)ep0[0] | (uint32_t)ep0[1] << 8 | (uint32_t)ep0[2] << 16;
+            if (uo.e0_ep == 0x02u) { uo.r48 = (uint8_t)(hz >= 46050u); uin_set_rate(uo.r48 ? 48000u : 44100u); }   /* (the audio output's rate) */
+            else ua_rate(hz);
+        }
         sie_wr(S_INDEX, 0); sie_wr(S_CSR0, C0_SERVED | C0_END);
         return;
     }
@@ -251,19 +280,27 @@ static void e0_service(void)
     case 0x0009:                                                             /* SET_CONFIGURATION */
         if (ep0[2] > 1) goto stall;
         conf = ep0[2];
-        if (conf) { ep1_setup(); ep4_setup(); }
+        if (conf) { ep1_setup(); ep4_setup(); ep2_setup(); }
         ua_stream(0); ua.r48 = (uint8_t)(ua.force == 2);
+        uo.alt = 0; uo.r48 = 0; uin_stream(0); uin_set_rate(44100u);
         break;
     case 0x8008: e0_send(&conf, 1, asked); return;                           /* GET_CONFIGURATION */
-    case 0x810A: { static uint8_t a; a = ep0[4] == 2 ? ua.alt : 0; e0_send(&a, 1, asked); return; }   /* GET_INTERFACE */
-    case 0x010B: if (ep0[4] == 2) ua_stream(ep0[2] & 1u); break;               /* SET_INTERFACE: the audio's alternate */
-    case 0x2201:                                                             /* SET_CUR, endpoint 4: its rate */
-        if (ep0[4] != 0x84u || ep0[3] != 1u) goto stall;
-        if (asked) { ua.e0_rx = 1; sie_wr(S_INDEX, 0); sie_wr(S_CSR0, C0_SERVED); return; }   /* (the 3 bytes follow) */
+    case 0x810A: { static uint8_t a; a = ep0[4] == 2 ? ua.alt : ep0[4] == 3 ? uo.alt : 0; e0_send(&a, 1, asked); return; }   /* GET_INTERFACE */
+    case 0x010B:                                                             /* SET_INTERFACE: the audio's alternate */
+        if (ep0[4] == 2) ua_stream(ep0[2] & 1u);
+        else if (ep0[4] == 3) { uo.alt = (uint8_t)(ep0[2] & 1u); uin_stream(uo.alt); }   /* (the output: streaming or not) */
+        break;
+    case 0x2201:                                                             /* SET_CUR, endpoint 4 or 2: its rate */
+        if ((ep0[4] != 0x84u && ep0[4] != 0x02u) || ep0[3] != 1u) goto stall;
+        if (asked) { uo.e0_ep = ep0[4]; ua.e0_rx = 1; sie_wr(S_INDEX, 0); sie_wr(S_CSR0, C0_SERVED); return; }   /* (the 3 bytes follow) */
         break;
     case 0xA281: case 0xA282: case 0xA283: {                                 /* GET_CUR / MIN / MAX: the rate */
         static const uint8_t R44[3] = { 0x44, 0xAC, 0x00 }, R48[3] = { 0x80, 0xBB, 0x00 };
-        if (ep0[4] != 0x84u || ep0[3] != 1u) goto stall;
+        if ((ep0[4] != 0x84u && ep0[4] != 0x02u) || ep0[3] != 1u) goto stall;
+        if (ep0[4] == 0x02u) {                                               /* the output takes both rates, the host's choice */
+            int o48 = req == 0x81 ? uo.r48 : req == 0x83;
+            e0_send(o48 ? R48 : R44, 3, asked); return;
+        }
         int r48 = req == 0x81 ? ua.r48 : req == 0x83 ? ua.force != 1 : ua.force == 2;
         e0_send(r48 ? R48 : R44, 3, asked); return;
     }
@@ -382,33 +419,29 @@ static void ep4_service(void)                          /* (the tick) a packet as
     sie_wr(S_TX_CSR1, 0x01);                             /* ready (and an underrun's flag cleared) */
 }
 
-/* (3.3.8, as SLOOP 2.8.5) a host there: the frame number (FRAME1, FRAME2) moves only with a real host, a millisecond a
- * frame; frozen 100 ms, or a suspend (the bus idle 3 ms), the cable is out (or the host asleep); a resume or a reset:
- * back. No reset comes when the cable is pulled, so the configuration alone said "there" until the next start */
-enum { S_FRAME1 = 12, S_FRAME2 = 13 };
-static volatile uint8_t suspended;
-static uint32_t t_frame, t_moved; static uint16_t frame_n;
-static void frame_watch(uint32_t bus)
+static void ep2_service(void)                          /* (the tick) the packet the host sent, taken at once */
 {
-    uint32_t now = time_ticks(), mhz = time_mhz();
-    if (bus & 0x01u) suspended = 1;                                /* suspend */
-    if (bus & 0x06u) { suspended = 0; t_moved = now; }             /* resume, reset */
-    if (!conf || now - t_frame < 10000u * mhz) return;             /* (every 10 ms) */
-    t_frame = now;
-    uint16_t f = (uint16_t)(sie_rd(S_FRAME1) | (sie_rd(S_FRAME2) & 7u) << 8);
-    if (f != frame_n) { frame_n = f; t_moved = now; suspended = 0; }
-    else if (now - t_moved > 100000u * mhz) suspended = 1;
+    sie_wr(S_INDEX, 2);
+    uint32_t csr = sie_rd(S_RX_CSR1) | sie_rd(S_RX_CSR2) << 8;
+    if (!(csr & 1u)) return;                           /* none this time */
+    uint32_t n = sie_rd(S_RX_CNT1) | sie_rd(S_RX_CNT2) << 8;
+    __asm__ volatile("ssync" ::: "memory");
+    if (n > UA_MAXF * 4u) n = UA_MAXF * 4u;
+    if (n >= 4u) uin_push((const uint32_t *)(const void *)ep2_out, n / 4u);
+    csr = (csr & ~0x164u) | 0x10u;                     /* the packet taken: the endpoint free again (as endpoint 1) */
+    sie_wr(S_RX_CSR1, csr & 0xFFu);
+    sie_wr(S_RX_CSR2, csr >> 8);
 }
+
 static void usb_service(void)
 {
     if (!open_) return;
-    if (U_CON0 & (1u << 13)) U_CON0 |= 1u << 12;                   /* a frame's start: acknowledged (it goes on with the
-                                                                    * cable out: no sign of a host, SLOOP 2.8.5 found) */
+    if (U_CON0 & (1u << 13)) U_CON0 |= 1u << 12;                   /* a frame's start: acknowledged */
     uint32_t bus = sie_rd(S_INT_USB), tx = sie_rd(S_INT_TX1), rx = sie_rd(S_INT_RX1);
-    frame_watch(bus);
     if (bus & 0x04u) {                                             /* a bus reset: back to the start */
         sie_wr(S_FADDR, 0);
         conf = 0; e0_sending = 0; addr_pending = 0; rx_pend = 0; ua.e0_rx = 0; ua_stream(0); ua.r48 = (uint8_t)(ua.force == 2);
+        uo.alt = 0; uo.r48 = 0; uin_stream(0);
         tx_r = tx_w;                                               /* (nothing stale for the next host) */
         U_EP0_ADR = (uint32_t)(uintptr_t)ep0;
         sie_wr(S_INT_USBE, 0x07); sie_wr(S_INT_TX1E, 0x01); sie_wr(S_INT_RX1E, 0);
@@ -416,6 +449,7 @@ static void usb_service(void)
     if (tx & 0x01u) e0_service();
     if (conf && ((rx & 0x02u) || rx_pend)) ep1_receive();
     if (conf) ep1_send();
+    if (conf && uo.alt) ep2_service();
     ep4_service();
 }
 void usb_midi_poll(void) { if (!ticking) usb_service(); }   /* (once the tick serves the port: nothing here) */
@@ -447,8 +481,7 @@ void usb_midi_open(void)
     conf = 0; open_ = 1;
 }
 int usb_midi_ready(void) { return open_ && conf; }
-int usb_host_live(void) { return open_ && conf && !suspended; }
-void usb_midi_close(void) { U_IO_CON0 &= ~0xF0u; open_ = 0; conf = 0; }   /* off the bus (D+ let go) */
+void usb_midi_close(void) { U_IO_CON0 &= ~0xF0u; open_ = 0; conf = 0; uo.alt = 0; uin_stream(0); }   /* off the bus (D+ let go) */
 int usb_midi_take(uint8_t pk[4])
 {
     if (rx_r == rx_w) return 0;

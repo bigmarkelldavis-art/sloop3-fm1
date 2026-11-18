@@ -129,6 +129,7 @@ GB_SMALL void snd_init(gb_sound *s, int16_t *fx_mem, int16_t *punch_mem)
         gb_patch_default(&k->patch, ENG_VA);
     }
     sm_init(&s->master, 0.8f, 30.0f);
+    sm_init(&s->uin_lvl, 0.0f, 20.0f);
     s->lim_gain = 1.0f;
     master_init(s, punch_mem);
     fx_init(s, fx_mem, punch_mem ? punch_mem + GB_HIST + 2 * GB_MODL + GB_CHO : 0);   /* (after: master_init clears its memory) */
@@ -680,6 +681,17 @@ GB_HOT void snd_mix(gb_sound *s, gb_bus *b, const gb_bus *other, int32_t *out)
         sm_end(&k->level, sl); sm_end(&k->pan, sp); sm_end(&k->send_dly, sd); sm_end(&k->send_rev, sr); sm_end(&k->filt, sf); sm_end(&k->send_cho, sc);
     }
     sm_end(&s->throw_dly, std_); sm_end(&s->throw_rev, str_);
+    /* USB AUDIO IN: what a computer or a phone plays to the FM-1, added to the mix dry: the master bus (the punch-ins,
+     * the DJ filter, the limiter) takes it as it takes the tracks. Its level moves smoothly (no click on a change) */
+    {
+        float us = sm_step(&s->uin_lvl), ug = s->uin_lvl.cur;
+        if (s->uin_l && s->uin_r && (ug > 0.0f || us != 0.0f)) {
+            const float *il = s->uin_l, *ir = s->uin_r;
+            GB_UNROLL4
+            for (int n = 0; n < GB_BLOCK; n++) { ug += us; ml[n] += il[n] * ug; mr[n] += ir[n] * ug; }
+        }
+        sm_end(&s->uin_lvl, us);
+    }
     float dry_l[GB_BLOCK], dry_r[GB_BLOCK];
     texture_mix(s, ml, mr, duck0, duck1);                              /* (the bed, dry) */
     master_pre(s, ml, mr, dl, dr, rl, rr, dry_l, dry_r);
@@ -711,7 +723,7 @@ GB_HOT void snd_mix(gb_sound *s, gb_bus *b, const gb_bus *other, int32_t *out)
         for (int n = 0; n < GB_BLOCK; n++) ml[n] = mr[n] = 0.0f;
         pk = 0.0f; snd_panic(s);
     }
-    if (s->lowcut == 1) {                                              /* the small speaker: two one-pole high-passes */
+    if (s->lowcut) {                                                   /* the small speaker: two one-pole high-passes */
         float a = s->lc[0], b2 = s->lc[1], c = s->lc[2], d = s->lc[3];
         for (int n = 0; n < GB_BLOCK; n++) {
             a += (ml[n] - a) * (1.0f / 64.0f); float x = ml[n] - a; b2 += (x - b2) * (1.0f / 64.0f); ml[n] = x - b2;
