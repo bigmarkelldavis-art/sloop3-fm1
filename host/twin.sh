@@ -32,6 +32,9 @@ same settings settings-reboot
 run sounds sounds -                        # 3.2: a DX7 bank's voices by name, SOUNDS, the favourites, the lights
 run sounds-reboot reboot $O/sounds/flash.bin
 same sounds sounds-reboot
+run usbin usbin -                          # USB AUDIO IN: a host plays, heard, the level, kept with the project
+run usbin-reboot reboot $O/usbin/flash.bin
+same usbin usbin-reboot
 run usbrec usbrec -                        # USB AUDIO IN: a host plays, heard, recorded into USR2 (the slot erased, the sectors, the header), played, kept
 run usbrec-reboot reboot $O/usbrec/flash.bin
 same usbrec usbrec-reboot

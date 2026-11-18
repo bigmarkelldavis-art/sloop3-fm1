@@ -111,7 +111,11 @@ void twin_flash_op(int kind, uint32_t a, uint32_t n)
     /* SLOOP 2.8's data (0x97000..) is never written: but its staging area (erasable), and a user slot the editor sends */
     if (a >= 0x97000u && !(a >= 0xE0000u && a < 0xE5000u)) {
         static const uint32_t AT[4] = { 0xA0000u, 0xB4000u, 0xC8000u, 0xE7000u };
-        int slot = 0; for (int k = 0; k < 4; k++) if (a >= AT[k] && a < AT[k] + SMP_USR_SIZE && (((ed_sm.on || ed_sm.phase) && ed_sm.k == k) || (ur_st && urec_slot == k))) slot = 1;   /* (USB REC: its own slot) */
+        int slot = 0; for (int k = 0; k < 4; k++) if (a >= AT[k] && a < AT[k] + SMP_USR_SIZE && (((ed_sm.on || ed_sm.phase) && ed_sm.k == k)
+#ifdef USB_REC
+                                                                            || (ur_st && urec_slot == k)
+#endif
+                                                                            )) slot = 1;   /* (USB REC: its own slot) */
         if (!slot && tw_sloop_writes++ < 5) printf("[%8.3f] !! TWIN: SLOOP 2.8's data written (%s at flash 0x%05X)\n", tw_s(), kind == 1 ? "an erase" : "a write", a);
     }
 }
@@ -257,7 +261,10 @@ static void digest(const char *name)
     for (int k = 0; k < US_N; k++) if (us_used(k)) fprintf(f, " %d:%s", k + 1, us_name(k));
     fprintf(f, "\nfavs"); for (int i = 0; i < US_NFAV; i++) fprintf(f, " %d", us_fav[i]);
     fprintf(f, "\ntracks"); for (int t = 0; t < NTRK; t++) fprintf(f, " %d/%d/%d", S.trk[t].patch.engine, preset_of[t], seq_count(&Q, t));
-    fprintf(f, "\nusb in %d lvl %d slot %d div %d usr %d %d %d %d", uin_on, uin_lvl, urec_slot, urec_div, smp_user_nz(0), smp_user_nz(1), smp_user_nz(2), smp_user_nz(3));   /* (USB AUDIO IN / REC) */
+    fprintf(f, "\nusb in %d lvl %d usr %d %d %d %d", uin_on, uin_lvl, smp_user_nz(0), smp_user_nz(1), smp_user_nz(2), smp_user_nz(3));   /* (USB AUDIO IN; the slots: USB REC) */
+#ifdef USB_REC
+    fprintf(f, " rec slot %d div %d", urec_slot, urec_div);
+#endif
     { uint32_t at, n = 0, c = 0; if (store_proj_find(&at, &n, &c) == 0) fprintf(f, "\nsaved %u %08X", n, c); }   /* (3.3.5: the saved project, byte for byte) */
     fprintf(f, "\n");
     fclose(f);
@@ -1961,6 +1968,39 @@ static int preset_named(const char *n);
 static int sb_goto(int cat) { for (int i = 0; i < SB_NCAT + 2 && sb_cat != cat; i++) turn(ENC_KNOB1, 1); return sb_cat == cat; }
 /* 3.3.6: YOUR KITS: a sample slot as the drum track's kit, by its sample's name; another kit, then found again with
  * PRESETS; saved with the project (the reboot after compares it) */
+static void sc_usbin(void)                    /* USB AUDIO IN: a host plays to the FM-1; heard; its level; kept with the project */
+{
+    boot_wait();
+    EXPECT(tw_audio_on, "no sound started");
+    for (int i = 0; i < 400 && splash_on; i++) wait_ms(10);
+    /* the host: 44.1 kHz stereo, a 440 Hz sine at half scale; the alternate setting 1 (usb.c does this on SET_INTERFACE) */
+    uin_set_rate(44100u); uin_stream(1);
+    tw_host_start(44100.0, 440.0, 0.5);
+    wait_ms(300);
+    EXPECT(!uin_active(), "USB IN off: the stream is taken (it is only pulled while on)");
+    uin_on = 1; home_apply();
+    wait_ms(400);
+    EXPECT(uin_active(), "USB IN on, a host playing: the stream is not locked");
+    double pk = peak_over(300);
+    printf("[%8.3f]    USB IN heard: peak %.4f (level %d of %d)\n", tw_s(), pk, uin_lvl, UIN_LVL_MAX);
+    EXPECT(pk > 0.05, "USB IN: the host's sine is not heard (%.4f)", pk);
+    /* level 0: silent, within a moment (smoothed) */
+    uin_lvl = 0; home_apply(); wait_ms(200);
+    double q = peak_over(200); EXPECT(q < 0.002, "USB IN level 0: still heard (%.4f)", q);
+    uin_lvl = 16; home_apply(); wait_ms(100);
+    /* the HOME page 5: KNOB 1 turned left switches it off, right on; KNOB 2 the level */
+    home_knob(5, 0, -1); EXPECT(!uin_on, "HOME USB IN: KNOB 1 left did not switch it off");
+    wait_ms(200); double off = peak_over(200); EXPECT(off < 0.002, "USB IN off: still heard (%.4f)", off);
+    home_knob(5, 0, 1); EXPECT(uin_on, "HOME USB IN: KNOB 1 right did not switch it on");
+    home_knob(5, 1, -4); EXPECT(uin_lvl == 12, "HOME USB IN: KNOB 2 -4 -> level %d", uin_lvl);
+    wait_ms(300); double lo = peak_over(200); EXPECT(lo > 0.02 && lo < pk, "USB IN at 60 %%: %.4f (full %.4f)", lo, pk);
+    /* the host goes away (the cable out: alternate setting 0): silence, not noise */
+    tw_host.on = 0; uin_stream(0); wait_ms(300);
+    double gone = peak_over(200); EXPECT(gone < 0.002, "USB IN: the host stopped and it is still heard (%.4f)", gone);
+    tap(B_SAVE); wait_ms(80); tap(B_SAVE); wait_saved(2000);        /* (the project kept with USB IN's settings) */
+}
+
+#ifdef USB_REC
 static void sc_usbrec(void)                   /* USB AUDIO IN: a host plays to the FM-1; heard; recorded into USR2; played back; kept */
 {
     boot_wait();
@@ -2038,6 +2078,7 @@ static void sc_usbrec(void)                   /* USB AUDIO IN: a host plays to t
     check_project_roundtrip("after USB REC");
     tap(B_SAVE); wait_ms(80); tap(B_SAVE); wait_saved(2000);        /* (the project kept with USB IN's settings; the slot is in the flash) */
 }
+#endif
 static void sc_ukit(void)
 {
     boot_wait();
@@ -2191,7 +2232,10 @@ static void sc_sounds(void)
     save_and_wait();
 }
 static const struct { const char *name; void (*fn)(void); } SC[] = {
-    { "boot", sc_boot }, { "reboot", sc_reboot }, { "sounds", sc_sounds }, { "ukit", sc_ukit }, { "usbrec", sc_usbrec }, { "pages", sc_pages }, { "record", sc_record },
+    { "boot", sc_boot }, { "reboot", sc_reboot }, { "sounds", sc_sounds }, { "ukit", sc_ukit }, { "usbin", sc_usbin },
+#ifdef USB_REC
+    { "usbrec", sc_usbrec },
+#endif { "pages", sc_pages }, { "record", sc_record },
     { "powercut", sc_powercut }, { "aftercut", sc_after_cut }, { "sample", sc_sample }, { "editor", sc_editor },
     { "monkey", sc_monkey }, { "import", sc_import }, { "midi", sc_midi }, { "rescue", sc_rescue }, { "calib", sc_calib }, { "settings", sc_settings }, { "play", sc_play }, { "levels", sc_levels }, { "mixui", sc_mixui }, { "fx", sc_fx }, { "editor2", sc_editor2 }, { "serve", sc_serve }, { "vis", sc_vis }, { "banksave", sc_banksave }, { "punch", sc_punch }, { "film", sc_film }, { "inst", sc_inst }, { "film2", sc_film2 }, { "bigproj", sc_bigproj }, { "bigcut", sc_bigcut }, { "punch2", sc_punch2 }, { "crumb", sc_crumb }, { "nan", sc_nan } };
 static void (*tw_sc)(void);

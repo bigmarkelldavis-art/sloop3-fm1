@@ -4,8 +4,6 @@
 #include "../core/gb.h"
 #if defined(__PI32V2__)
 #define XT __attribute__((section(".xtext.store")))      /* (3.3.5: what never runs while the flash works: from the window) */
-#elif defined(HOST)
-#define XT __attribute__((section("tw_xt")))       /* (the twin: what calls an erase or a write from here is caught) */
 #else
 #define XT
 #endif
@@ -23,13 +21,14 @@ static struct { int state, known; uint32_t bank, len, given, prog, vat, vcrc, ne
 
 /* a byte at a time through a table (1 KB, made at the first call): a 20 KB project in ~0.3 ms, between two audio
  * blocks */
-static uint32_t CRC_T[256];
+/* CRC-32 (IEEE) a nibble at a time: a table of 16 (64 bytes, in the flash) rather than 256 in RAM (1 KB of the slot's) */
+static const uint32_t CRC_N[16] = { 0x00000000u, 0x1DB71064u, 0x3B6E20C8u, 0x26D930ACu, 0x76DC4190u, 0x6B6B51F4u, 0x4DB26158u, 0x5005713Cu,
+                                    0xEDB88320u, 0xF00F9344u, 0xD6D6A3E8u, 0xCB61B38Cu, 0x9B64C2B0u, 0x86D3D2D4u, 0xA00AE278u, 0xBDBDF21Cu };
 uint32_t crc32_ieee(uint32_t crc, const void *d, uint32_t n)
 {
-    if (!CRC_T[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = c & 1u ? (c >> 1) ^ 0xEDB88320u : c >> 1; CRC_T[i] = c; }
     const uint8_t *p = (const uint8_t *)d;
     crc = ~crc;
-    while (n--) crc = CRC_T[(crc ^ *p++) & 255u] ^ (crc >> 8);
+    while (n--) { crc ^= *p++; crc = CRC_N[crc & 15u] ^ (crc >> 4); crc = CRC_N[crc & 15u] ^ (crc >> 4); }
     return ~crc;
 }
 /* the areas: 0..8 the projects', 9 and 10 the user sounds' two copies (4 KB, 0x95000 and 0x96000) */
@@ -146,25 +145,6 @@ XT int store_proj_find(uint32_t *data_at, uint32_t *len, uint32_t *crc)
     if (crc) *crc = h.dcrc;
     return 0;
 }
-/* (3.3.8) a save while the music plays: an erase keeps the flash window off for milliseconds, and what the sound reads
- * from the flash (the samples, the kits) is silent meanwhile: a stutter. So the bank the next save goes to is erased
- * beforehand, a sector at a time, while it is stopped and nobody plays (store_proj_prep); a save then only writes pages
- * (each well under a millisecond, between two audio halves). Only the sectors the project fills are erased, too. The
- * newest whole copy is never touched: the bank prepared is the other one */
-static uint8_t pre_known; static uint32_t pre_bank, pre_n;     /* pre_n: its sectors from the first, erased */
-/* (3.3.8 fix) in RAM, not XT: it starts an erase, the window goes off, and it must still return (from the window: the
- * FM-1 froze at the logo, then the watchdog restarted it) */
-int store_proj_prep(void)
-{
-    if (W.state == 1 || R.state == 1 || (P.state > 0 && P.state < 7) || F->busy()) return 0;
-    if (!pre_known) { hdr h; int k = pnewest(&h); pre_bank = k == 0 ? 1u : 0u; pre_n = 0; pre_known = 1; return 1; }   /* (read: a pass of its own) */
-    if (pre_n >= PSECT) return 0;
-    if (F->erase_start(pbank(pre_bank) + pre_n * 4096u)) { pre_known = 0; return 0; }
-    pre_n++;
-    return 1;
-}
-XT int store_proj_ready(void) { return pre_known && pre_n >= PSECT; }
-int store_erasing(void) { return P.state == 1 || (W.state == 1 && W.at < size_of(W.copy) / 4096u); }
 XT int store_proj_begin(uint32_t len, uint32_t crc, int known)
 {
     if (W.state == 1 || R.state == 1 || (P.state > 0 && P.state < 7) || len < 16u || len > STORE_PMAX) return -1;
@@ -175,11 +155,8 @@ XT int store_proj_begin(uint32_t len, uint32_t crc, int known)
     P.bank = k == 0 ? 1u : 0u; P.len = len; P.known = known; P.given = 0; P.prog = 0; P.vat = 0; P.vcrc = 0; P.d = 0; P.d_n = 0; P.d_off = 0;
     P.h.magic = MAGIC3; P.h.seq = seq + 1u; P.h.len = len; P.h.dcrc = crc; P.h.slot = 0; P.h.pad[0] = P.h.pad[1] = P.h.pad[2] = 0;
     P.h.hcrc = crc32_ieee(0, &P.h, 20);
-    /* (3.3.8) the sectors the copy fills, those not erased beforehand */
-    P.need_n = (256u + len + 4095u) / 4096u; if (P.need_n > PSECT) P.need_n = PSECT;
-    P.vat = pre_known && pre_bank == P.bank ? (pre_n < P.need_n ? pre_n : P.need_n) : 0u;
-    pre_known = 0;                                       /* (written now: prepared again after it) */
-    W.done_ops = 0; W.all_ops = (P.need_n - P.vat) + (len + 255u) / 256u + (len + 1023u) / 1024u + 1u;
+    W.done_ops = 0; W.all_ops = PSECT + (len + 255u) / 256u + (len + 1023u) / 1024u + 1u;
+    P.need_n = 0;
     P.state = 1;                                         /* the sectors */
     return 0;
 }
@@ -207,7 +184,7 @@ static int proj_step(void)
     uint32_t base = pbank(P.bank);
     switch (P.state) {
     case 1:                                              /* the sectors, one at a time */
-        if (P.vat < P.need_n) { if (F->erase_start(base + P.vat * 4096u)) { P.state = 0; return -1; } P.vat++; W.done_ops++; return 1; }
+        if (P.vat < PSECT) { if (F->erase_start(base + P.vat * 4096u)) { P.state = 0; return -1; } P.vat++; W.done_ops++; return 1; }
         P.vat = 0; P.state = 2; return 1;
     case 2:                                              /* the data: what was given, a page's part at a time */
         if (P.prog >= P.len) { P.state = 3; return 1; }

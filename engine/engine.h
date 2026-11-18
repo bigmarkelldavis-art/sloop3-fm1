@@ -271,8 +271,8 @@ typedef struct gb_sound {
     float lc[4];
     float flt_q;                                       /* HOME > AUDIO > FILTER RESO: the tracks' filters' Q */
     uint8_t usb_full;                                  /* HOME > AUDIO > USB FULL: usb_l / usb_r the mix before MASTER */
-    const float *uin_l, *uin_r;                        /* USB AUDIO IN (app/usbin.h): a block the firmware pulled, mixed in dry before the master
-                                                        * bus (0: none this block); its level, smoothed */
+    const float *uin;                                  /* USB AUDIO IN (app/usbin.h): a mono block the firmware pulled, mixed in dry before the
+                                                        * master bus (0: none this block); its level, smoothed */
     gb_smooth uin_lvl;
     uint8_t tx[7];                                     /* TEXTURE (texture.c): SRC LEVEL TONE (int8) MOVE RATE WHEN DUCK */
     float usb_l[GB_BLOCK], usb_r[GB_BLOCK];

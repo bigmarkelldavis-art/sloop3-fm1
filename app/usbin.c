@@ -1,67 +1,68 @@
 /* SPDX-License-Identifier: GPL-3.0-only
- * USB AUDIO IN (usbin.h): a single-producer single-consumer ring of 16-bit stereo frames, read at the engine's rate by
- * linear interpolation, the read step steered by how full the ring is. Written for this project. */
+ * USB AUDIO IN (usbin.h): the packets converted as they arrive (integer linear interpolation, the step steered by the ring's
+ * fill) into a single-producer single-consumer ring of mono 16-bit samples at the engine's rate. Written for this project. */
 #include "usbin.h"
 
-static uint32_t ring[UIN_N];
-static volatile uint32_t w;                 /* written by the producer only */
-static volatile uint32_t rd;                /* written by the consumer only */
-static volatile uint8_t streaming, flush;   /* the producer sets them; the consumer acts on them */
-static volatile uint32_t host_hz = 44100u;
-static volatile uint32_t lost;              /* (the producer's drops and the consumer's holds: a count for the screen) */
+#define BASE_44 65510u                       /* host Hz / the engine's Hz, 16.16: 44100 / 44117.647 */
+#define BASE_48 71303u                       /* 48000 / 44117.647 */
+
+static int16_t ring[UIN_N];
+static volatile uint16_t w, rd;             /* the next to write (the producer's), the next to read (the consumer's) */
+static volatile uint8_t streaming, flush;
+static volatile uint32_t base = BASE_44;
+static volatile uint32_t lost;              /* (a count for the screen; both sides add to it) */
+/* the producer's: the conversion */
+static int32_t prev;                        /* the last input sample */
+static uint32_t frac, avg;                  /* the next output's place after prev (16.16); the fill, filtered (x 4096) */
+static uint8_t started;
 /* the consumer's */
 static uint8_t locked, dry_blocks;
-static float frac, avg, a_l, a_r, b_l, b_r;
+static float last;
 
-void uin_set_rate(uint32_t hz) { host_hz = hz >= 46050u ? 48000u : 44100u; flush = 1; }
-void uin_reset(void) { flush = 1; lost = 0; }
-void uin_stream(int on) { streaming = (uint8_t)(on != 0); flush = 1; }
+uint32_t uin_fill(void) { int32_t f = (int32_t)w - (int32_t)rd; return (uint32_t)(f < 0 ? f + (int32_t)UIN_N : f); }
+void uin_set_rate(uint32_t hz) { base = hz >= 46050u ? BASE_48 : BASE_44; }
+void uin_reset(void) { started = 0; flush = 1; lost = 0; }
+void uin_stream(int on) { streaming = (uint8_t)(on != 0); started = 0; flush = 1; }
 int uin_active(void) { return streaming && locked; }
-uint32_t uin_fill(void) { return w - rd; }
 uint32_t uin_lost(void) { return lost; }
 
 void uin_push(const uint32_t *f, uint32_t n)
 {
-    if (!streaming) return;
-    uint32_t wi = w;
+    if (!streaming || !n) return;
+    if (!started) { started = 1; prev = ((int32_t)(int16_t)(f[0] & 0xFFFFu) + (int32_t)(int16_t)(f[0] >> 16)) >> 1; frac = 0; avg = UIN_TARGET << 12; }
+    /* the step: the base ratio, nudged by how far the average fill is from the target (a percent at most: it settles in a moment after a start) */
+    int32_t e = ((int32_t)(avg >> 12) - (int32_t)UIN_TARGET), adj = e * 3;
+    adj = adj > 655 ? 655 : adj < -655 ? -655 : adj;
+    uint32_t step = (uint32_t)((int32_t)base + adj), wi = w;
     for (uint32_t i = 0; i < n; i++) {
-        if (wi - rd >= UIN_N) { lost += n - i; break; }     /* full: the rest of the packet is dropped */
-        ring[wi & (UIN_N - 1u)] = f[i];
-        wi++;
+        int32_t x = ((int32_t)(int16_t)(f[i] & 0xFFFFu) + (int32_t)(int16_t)(f[i] >> 16)) >> 1;
+        while (frac < 65536u) {                                  /* the outputs between prev and x */
+            int32_t o = prev + (int32_t)(((x - prev) * (int32_t)(frac >> 1)) >> 15);
+            uint32_t nx = wi + 1u == UIN_N ? 0u : wi + 1u;
+            if (nx == rd) lost++; else { ring[wi] = (int16_t)o; wi = nx; }       /* (full: this one is dropped) */
+            frac += step;
+        }
+        frac -= 65536u; prev = x;
     }
-    w = wi;
+    w = (uint16_t)wi;
+    uint32_t fill = uin_fill();
+    avg += (int32_t)((fill << 12) - avg) >> 8;                   /* (about a quarter of a second) */
 }
 
-static float fl(uint32_t fr) { return (float)(int16_t)(fr & 0xFFFFu) * (1.0f / 32768.0f); }
-static float fr_(uint32_t fr) { return (float)(int16_t)(fr >> 16) * (1.0f / 32768.0f); }
-
-int uin_pull(float *l, float *r, uint32_t n)
+int uin_pull(float *m, uint32_t n)
 {
-    if (flush) { flush = 0; rd = w; locked = 0; frac = 0.0f; dry_blocks = 0; }
-    if (!streaming) { for (uint32_t i = 0; i < n; i++) l[i] = r[i] = 0.0f; return 0; }
-    uint32_t fill = w - rd;
+    if (flush) { flush = 0; rd = w; locked = 0; dry_blocks = 0; last = 0.0f; }
+    if (!streaming) { for (uint32_t i = 0; i < n; i++) m[i] = 0.0f; return 0; }
+    uint32_t fill = uin_fill();
     if (!locked) {
-        if (fill < UIN_TARGET) { for (uint32_t i = 0; i < n; i++) l[i] = r[i] = 0.0f; return 0; }
-        uint32_t f0 = ring[rd & (UIN_N - 1u)];
-        b_l = fl(f0); b_r = fr_(f0); a_l = b_l; a_r = b_r;           /* (starts from the first frame, no jump) */
-        rd++; frac = 0.0f; avg = (float)fill; locked = 1; dry_blocks = 0;
+        if (fill < 200u) { for (uint32_t i = 0; i < n; i++) m[i] = 0.0f; return 0; }   /* (waits for some fill; the step then settles the rest) */
+        locked = 1; dry_blocks = 0;
     }
-    avg += ((float)fill - avg) * 0.05f;
-    float corr = (avg - (float)UIN_TARGET) * (1.0f / (float)UIN_TARGET) * 0.002f;
-    corr = corr > 0.004f ? 0.004f : corr < -0.004f ? -0.004f : corr;
-    float step = (float)host_hz * (1.0f / UIN_ENGINE_HZ) * (1.0f + corr);
-    uint32_t held = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        l[i] = a_l + (b_l - a_l) * frac;
-        r[i] = a_r + (b_r - a_r) * frac;
-        frac += step;
-        while (frac >= 1.0f) {
-            frac -= 1.0f; a_l = b_l; a_r = b_r;
-            if (rd != w) { uint32_t f = ring[rd & (UIN_N - 1u)]; rd++; b_l = fl(f); b_r = fr_(f); }
-            else held++;                                            /* (the ring empty: the last frame again) */
-        }
-    }
-    if (held) { lost += held; if (++dry_blocks >= 16u) { locked = 0; dry_blocks = 0; } }   /* (~23 ms dry: the host has stopped) */
+    uint32_t r = rd, have = fill < n ? fill : n;
+    for (uint32_t i = 0; i < have; i++) { last = (float)ring[r] * (1.0f / 32768.0f); m[i] = last; r = r + 1u == UIN_N ? 0u : r + 1u; }
+    for (uint32_t i = have; i < n; i++) m[i] = last;             /* (the ring empty: the last sample again) */
+    rd = (uint16_t)r;
+    if (have < n) { lost += n - have; if (++dry_blocks >= 16u) { locked = 0; dry_blocks = 0; } }   /* (long dry: the host has stopped) */
     else dry_blocks = 0;
     return 1;
 }

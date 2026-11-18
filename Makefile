@@ -3,7 +3,7 @@ CC ?= cc
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off
 ENGINE = engine/sound.c engine/fx.c engine/master.c engine/common.c engine/va.c engine/drum.c engine/drumkits.c engine/fm.c engine/lofi.c engine/pd.c engine/wheel.c engine/noise.c engine/voice.c engine/trio.c engine/phys.c engine/fm6.c engine/fm6_patches.c engine/sample.c engine/grain.c engine/slice.c engine/slice_scan.c engine/trackfx.c engine/texture.c engine/engines.c
 .PHONY: test demo clean levels fuzz twin denorm fonts
-test: build/sound_test build/seq_test build/store_test build/harmony_test build/arp_test build/level_tool build/sloop_test build/midi_test build/ui_shots
+test: build/sound_test build/seq_test build/store_test build/harmony_test build/arp_test build/level_tool build/sloop_test build/midi_test build/usbin_test build/usbrec_test build/ui_shots
 	./build/sound_test
 	./build/seq_test
 	./build/store_test
@@ -12,6 +12,8 @@ test: build/sound_test build/seq_test build/store_test build/harmony_test build/
 	./build/level_tool check
 	./build/sloop_test
 	./build/midi_test
+	./build/usbin_test
+	./build/usbrec_test
 	mkdir -p build/shots && ./build/ui_shots
 build/harmony_test: tests/harmony_test.c app/harmony.c app/harmony.h
 	mkdir -p build && $(CC) $(CFLAGS) -o $@ tests/harmony_test.c app/harmony.c
@@ -23,6 +25,10 @@ build/sloop_test: tests/sloop_test.c app/sloopimport.c app/sloop_kinds.c app/sto
 	mkdir -p build && $(CC) $(CFLAGS) -o $@ tests/sloop_test.c app/sloopimport.c app/sloop_kinds.c app/store.c app/presets.c app/preset_data.c app/usersnd.c seq/seq.c $(ENGINE) -lm
 build/midi_test: tests/midi_test.c app/midi.c app/midi.h app/edproto.c app/edproto.h
 	mkdir -p build && $(CC) $(CFLAGS) -o $@ tests/midi_test.c app/midi.c app/edproto.c
+build/usbin_test: tests/usbin_test.c app/usbin.c app/usbin.h
+	mkdir -p build && $(CC) $(CFLAGS) -o $@ tests/usbin_test.c app/usbin.c -lm
+build/usbrec_test: tests/usbrec_test.c app/usbrec.c app/usbrec.h $(ENGINE)
+	mkdir -p build && $(CC) $(CFLAGS) -o $@ tests/usbrec_test.c app/usbrec.c $(ENGINE) -lm
 build/arp_test: tests/arp_test.c app/arp.c app/arp.h
 	mkdir -p build && $(CC) $(CFLAGS) -o $@ tests/arp_test.c app/arp.c
 build/ui_shots: tests/ui_shots.c app/ui.c app/ui.h app/gfx.c app/gfx.h app/fonts.c app/vis.c app/vis.h
@@ -47,10 +53,12 @@ fuzz: build/fuzz
 build/fuzz: $(FUZZSRC)
 	mkdir -p build && gcc -O1 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -ffp-contract=off -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer -o $@ $(FUZZSRC) -lm
 # the PC twin: fw/main.c itself on a simulated FM-1 (host/), its scenarios (host/twin.sh), under the sanitizers
-TWINSRC = host/twin.c host/hal.c app/project.c app/psound.c app/presets.c app/preset_data.c app/sloopimport.c app/sloop_kinds.c app/usersnd.c app/xbank.c app/edproto.c app/store.c app/ui.c app/gfx.c app/vis.c app/fonts.c app/harmony.c app/midi.c app/arp.c app/engdesc.c app/demo_song.c seq/seq.c $(ENGINE)
+TWINSRC = host/twin.c host/hal.c app/project.c app/psound.c app/presets.c app/preset_data.c app/sloopimport.c app/sloop_kinds.c app/usersnd.c app/xbank.c app/edproto.c app/store.c app/ui.c app/gfx.c app/vis.c app/fonts.c app/harmony.c app/midi.c app/arp.c app/engdesc.c app/demo_song.c app/usbin.c app/usbrec.c seq/seq.c $(ENGINE)
 twin: build/twin build/fw/fw.area
 	sh host/twin.sh 60 "1 2"
 build/twin: $(TWINSRC) fw/main.c host/twin.h
+	mkdir -p build && gcc -DHOST -DUSB_REC -O1 -g -std=gnu11 -w -ffp-contract=off -fsanitize=address,undefined -fno-omit-frame-pointer -pthread -o $@ $(TWINSRC) -lm
+build/twin-lean: $(TWINSRC) fw/main.c host/twin.h
 	mkdir -p build && gcc -DHOST -O1 -g -std=gnu11 -w -ffp-contract=off -fsanitize=address,undefined -fno-omit-frame-pointer -pthread -o $@ $(TWINSRC) -lm
 demo: build/demo
 	./build/demo build/demo.wav

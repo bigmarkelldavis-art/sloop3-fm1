@@ -4,7 +4,7 @@
 set -eu
 TC=${1:-${PI32V2_LLVM:-toolchain/bin}}
 O=build/fw; rm -rf $O; mkdir -p $O/o
-CF="${BOOT_DIAG:+-DBOOT_DIAG} -mcpu=ac791n -O2 -ffreestanding -fno-builtin -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter"
+CF="${BOOT_DIAG:+-DBOOT_DIAG} ${USB_REC:+-DUSB_REC} -mcpu=ac791n -O2 -ffreestanding -fno-builtin -ffunction-sections -fdata-sections -Wall -Wextra -Wno-unused-parameter"
 for f in engine/sound.c engine/fx.c engine/common.c engine/va.c engine/drum.c engine/fm.c engine/lofi.c engine/pd.c engine/wheel.c engine/noise.c engine/voice.c engine/trio.c engine/phys.c engine/fm6.c engine/sample.c engine/grain.c engine/trackfx.c engine/texture.c engine/engines.c core/libc.c hal/fm1/audio.c; do
   "$TC/clang" $CF -c $f -o $O/o/$(basename $f .c).o
 done

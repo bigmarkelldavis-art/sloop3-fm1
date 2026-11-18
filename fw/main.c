@@ -72,7 +72,9 @@
 #include "../app/xbank.h"
 #include "../hal/fm1/usb.h"
 #include "../app/usbin.h"
+#ifdef USB_REC
 #include "../app/usbrec.h"
+#endif
 #include "../hal/fm1/uart.h"
 #include "../hal/fm1/irq.h"
 
@@ -464,19 +466,23 @@ static void job_voices(uint32_t arg) { (void)arg; snd_render_voices(&S, &busB, 1
 enum { HS_ACCEL, HS_LIGHTS, HS_KEYS, HS_NOTES, HS_LOWCUT, HS_USB, HS_RATE, HS_RESO, HS_DPREV, HS_CORE2, HS_N };
 static uint8_t hs[HS_N] = { 1, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
 static const uint8_t HS_MAX[HS_N] = { 1, 3, 3, 1, 1, 1, 2, 10, 1, 1 };
-/* USB AUDIO IN and USB REC (app/usbin.h, app/usbrec.h): what a computer or a phone plays to the FM-1's USB audio output,
- * mixed in and/or recorded into one of your sample slots. Kept with the project's HOME bytes: 77 (on | REC's rate << 4),
- * 78 (the level), 79 (REC's slot); not in hs[], whose first ten bytes are the device's older settings. */
+/* USB AUDIO IN (app/usbin.h): what a computer or a phone plays to the FM-1's USB audio output, mixed in. Kept with the
+ * project's HOME bytes: 77 (on | REC's rate << 4), 78 (the level), 79 (REC's slot); not in hs[], whose first ten bytes are
+ * the device's older settings. USB REC (app/usbrec.h, the build flag USB_REC: the RAM is tight) records it into a sample slot. */
 #define UIN_LVL_MAX 20
-static uint8_t uin_on, uin_lvl = 16, urec_slot, urec_div;     /* on; level 0..20 (x 5 %); REC's slot 0..3 and rate 0..2 (all, half, quarter) */
-static float uin_bl[GB_BLOCK], uin_br[GB_BLOCK];
+static uint8_t uin_on, uin_lvl = 16;                           /* on; level 0..20 (x 5 %) */
 enum { UR_IDLE, UR_ERASE, UR_REC, UR_END, UR_HEAD };           /* the take: the slot erased, recording, the last sectors, the header */
-static uint8_t ur_st, ur_e;                                    /* its state; the sector being erased */
+#ifdef USB_REC
+static uint8_t urec_slot, urec_div;                            /* REC's slot 0..3 and rate 0..2 (all, half, quarter) */
+static uint8_t ur_st, ur_e;                                    /* the take's state; the sector being erased */
 static uint32_t ur_sec;                                        /* the sector being written */
 static usbrec ur_r;
 COLD static void urec_start(void);
 COLD static void urec_stop_user(void);
 #define urec_finish_user_off() urec_stop_user()
+#else
+#define ur_st 0
+#endif
 static uint8_t cal_ok, cal_btn[14], cal_enc[7]; static int8_t cal_dir[7];   /* the calibration (panel_map) */
 static int home_sec;                                   /* HOME held: 0 the projects, 1..3 the settings */
 static int cal_step = -1;
@@ -554,13 +560,17 @@ __attribute__((noinline)) static void render_block(int32_t *out)
         S.grid = g;
     } else S.grid = -1.0f;
     for (int t = 0; t < SEQ_NTRK && t < GB_NTRACK; t++) { int w = Q.swing + Q.t[t].swing; S.trk[t].swing = (uint8_t)(w > 100 ? 100 : w); }
-    /* USB AUDIO IN: this block of what the host plays (the ring brings it to our rate); mixed in by snd_mix, and
-     * kept while a take runs (before the level: the take has the host's own) */
+    /* USB AUDIO IN: this block of what the host plays (mono, at our rate; it borrows usb_l, the USB FULL capture's block,
+     * which snd_mix writes after it has read this); mixed in by snd_mix, and kept while a take runs */
+#ifdef USB_REC
     if (uin_on || ur_st == UR_REC) {
-        int act = uin_pull(uin_bl, uin_br, GB_BLOCK);
-        S.uin_l = act && uin_on ? uin_bl : 0; S.uin_r = act && uin_on ? uin_br : 0;
-        if (act && ur_st == UR_REC) urec_feed(&ur_r, uin_bl, uin_br, GB_BLOCK);
-    } else S.uin_l = S.uin_r = 0;
+        int act = uin_pull(S.usb_l, GB_BLOCK);
+        S.uin = act && uin_on ? S.usb_l : 0;
+        if (act && ur_st == UR_REC) urec_feed(&ur_r, S.usb_l, S.usb_l, GB_BLOCK);
+    } else S.uin = 0;
+#else
+    S.uin = uin_on && uin_pull(S.usb_l, GB_BLOCK) ? S.usb_l : 0;
+#endif
     crumb_at(W_VOICES);
     if (two && hs[HS_CORE2] && cpu1_run(job_voices, 0)) {
         snd_render_voices(&S, &busA, 0, 2);
@@ -951,10 +961,20 @@ COLD static int notes_on(void) { return sticky == PG_NOTES && !is_drum(trk) && h
 COLD static int force_of(int vel, int acc) { return acc ? 4 : vel < 50 ? 0 : vel < 85 ? 1 : vel < 115 ? 2 : 3; }
 static const char *const FORCE[5] = { "GHOST", "SOFT", "NORM", "HARD", "ACC" };
 /* ---------------------------------------------------------------- HOME: the menu's sections, the calibration */
-static const char *const HOME_SEC[7] = { "PROJECT", "SCREEN 1/6", "LIGHTS 2/6", "AUDIO 3/6", "SEQ · SYSTEM 4/6", "USB IN 5/6", "USB REC 6/6" };
-static const int8_t HOME_ROW[7][4] = { { -1, -1, -1, -1 }, { -4, HS_ACCEL, -1, -1 }, { HS_LIGHTS, HS_KEYS, HS_NOTES, -1 },
+#ifdef USB_REC
+#define HOME_NSEC 7
+static const char *const HOME_SEC[HOME_NSEC] = { "PROJECT", "SCREEN 1/6", "LIGHTS 2/6", "AUDIO 3/6", "SEQ · SYSTEM 4/6", "USB IN 5/6", "USB REC 6/6" };
+#else
+#define HOME_NSEC 6
+static const char *const HOME_SEC[HOME_NSEC] = { "PROJECT", "SCREEN 1/5", "LIGHTS 2/5", "AUDIO 3/5", "SEQ · SYSTEM 4/5", "USB IN 5/5" };
+#endif
+static const int8_t HOME_ROW[HOME_NSEC][4] = { { -1, -1, -1, -1 }, { -4, HS_ACCEL, -1, -1 }, { HS_LIGHTS, HS_KEYS, HS_NOTES, -1 },
                                        { HS_LOWCUT, HS_USB, HS_RATE, HS_RESO }, { HS_DPREV, HS_CORE2, -2, -3 },
-                                       { -5, -6, -10, -1 }, { -7, -8, -9, -1 } };   /* (-5 IN, -6 LEVEL, -10 STREAM; -7 SLOT, -8 LENGTH, -9 REC) */
+                                       { -5, -6, -10, -1 }
+#ifdef USB_REC
+                                       , { -7, -8, -9, -1 }
+#endif
+                                       };   /* (-5 IN, -6 LEVEL, -10 STREAM; -7 SLOT, -8 LENGTH, -9 REC) */
 static const char *const HS_LABEL[HS_N] = { "ACCEL", "LIGHTS", "KEYS", "NOTES", "SPEAKER", "USB", "RATE", "RESO", "PREVIEW", "CORE 2" };
 COLD static const char *home_value(int i, char *b)
 {
@@ -1014,6 +1034,7 @@ COLD static void home_usb_knob(ui_view *v, int i, int r)    /* the USB IN and US
     case -5: knob(v, i, "USB IN", uin_on ? "ON" : "OFF", uin_on ? 100 : 0, 0); break;
     case -6: p = put_u(c, (uint32_t)uin_lvl * 5u); *put_s(p, "%") = 0; knob(v, i, "LEVEL", c, uin_lvl * 100 / UIN_LVL_MAX, 0); break;
     case -10: knob(v, i, "STREAM", uin_active() ? "LIVE" : "--", (int)(uin_fill() * 100u / UIN_N), 0); break;
+#ifdef USB_REC
     case -7: p = put_s(c, "USR"); *put_u(p, (uint32_t)urec_slot + 1u) = 0; knob(v, i, "SLOT", c, urec_slot * 100 / (SMP_NUSR - 1), 0); break;
     case -8: { static const char *const LN[3] = { "3.7s", "7.4s", "14.8s" }; knob(v, i, "LENGTH", LN[urec_div % 3], urec_div * 50, 0); break; }
     case -9: {
@@ -1026,6 +1047,7 @@ COLD static void home_usb_knob(ui_view *v, int i, int r)    /* the USB IN and US
         } else if (ur_st) t = "SAVING";
         knob(v, i, "REC", t, pct, hot); break;
     }
+#endif
     default: v->knob[i].label = 0; break;
     }
 }
@@ -1043,11 +1065,17 @@ COLD static void home_knob(int sec, int kn, int d)
         int n = UI_NTHEMES + (theme_ok() ? 1 : 0), c = scr_color + d;
         scr_color = (uint8_t)(c < 0 ? 0 : c > n - 1 ? n - 1 : c); color_apply(); return;
     }
-    if (i == -5) { uin_on = (uint8_t)(d > 0); if (!uin_on && ur_st == UR_REC) urec_finish_user_off(); home_apply(); say(uin_on ? "USB IN: ON · PLAY TO THE FM-1" : "USB IN: OFF"); return; }
+    if (i == -5) { uin_on = (uint8_t)(d > 0);
+#ifdef USB_REC
+        if (!uin_on && ur_st == UR_REC) urec_finish_user_off();
+#endif
+        home_apply(); say(uin_on ? "USB IN: ON · PLAY TO THE FM-1" : "USB IN: OFF"); return; }
     if (i == -6) { int l = uin_lvl + d; uin_lvl = (uint8_t)(l < 0 ? 0 : l > UIN_LVL_MAX ? UIN_LVL_MAX : l); home_apply(); return; }
+#ifdef USB_REC
     if (i == -7) { if (ur_st) { say("REC RUNNING"); return; } int k = urec_slot + d; urec_slot = (uint8_t)(k < 0 ? 0 : k > SMP_NUSR - 1 ? SMP_NUSR - 1 : k); return; }
     if (i == -8) { if (ur_st) { say("REC RUNNING"); return; } int k = urec_div + d; urec_div = (uint8_t)(k < 0 ? 0 : k > 2 ? 2 : k); return; }
     if (i == -9) { if (d > 0) urec_start(); else if (d < 0) urec_stop_user(); return; }
+#endif
     if (i < 0) return;
     int v = hs[i] + d; hs[i] = (uint8_t)(v < 0 ? 0 : v > HS_MAX[i] ? HS_MAX[i] : v);
     home_apply();
@@ -1705,7 +1733,11 @@ COLD static void proj_extra(project_extra *xp)
     for (int i = 0; i < 7; i++) x.tex[i] = S.tx[i];
     for (int i = 0; i < 4; i++) x.fxv[i] = fxv[i];
     x.tex[7] = 0;
+#ifdef USB_REC
     x.home[77] = (uint8_t)(uin_on | urec_div << 4); x.home[78] = uin_lvl; x.home[79] = urec_slot;
+#else
+    x.home[77] = uin_on; x.home[78] = uin_lvl;
+#endif
     x.home[40] = m_rmch; x.home[41] = m_fxch; x.home[42] = m_bend; x.home[75] = scr_color; x.home[76] = (uint8_t)(0x80u | vis_style);   /* (3.3.6: bit 7, one of the six) */
     for (int i = 0; i < ML_N; i++) { x.home[43 + 2 * i] = (uint8_t)(ml_tab[i] & 0xFF); x.home[44 + 2 * i] = (uint8_t)(ml_tab[i] >> 8); }
     if (cal_ok) { x.home[10] = 1; for (int i = 0; i < 14; i++) x.home[11 + i] = cal_btn[i]; for (int i = 0; i < 7; i++) { x.home[25 + i] = cal_enc[i]; x.home[32 + i] = (uint8_t)(cal_dir[i] > 0); } }
@@ -1758,9 +1790,16 @@ COLD static void home_from(const uint8_t *h)
 {
     home_had = 1;
     for (int i = 0; i < HS_N; i++) hs[i] = h[i] <= HS_MAX[i] ? h[i] : hs[i];
-    if (h[77] != 0xFF) { uin_on = (uint8_t)(h[77] & 1u); urec_div = (h[77] >> 4) <= 2 ? (uint8_t)(h[77] >> 4) : 0; }
+    if (h[77] != 0xFF) {
+        uin_on = (uint8_t)(h[77] & 1u);
+#ifdef USB_REC
+        urec_div = (h[77] >> 4) <= 2 ? (uint8_t)(h[77] >> 4) : 0;
+#endif
+    }
     if (h[78] <= UIN_LVL_MAX) uin_lvl = h[78];
+#ifdef USB_REC
     if (h[79] < SMP_NUSR) urec_slot = h[79];
+#endif
     if (h[40] <= 16) m_rmch = h[40];
     if (h[41] <= 16) m_fxch = h[41];
     if (h[42] >= 1 && h[42] <= 12) m_bend = h[42];
@@ -2151,6 +2190,7 @@ static int ed_job(uint32_t sector, uint32_t off, const uint8_t *d, uint32_t n, i
     return 0;
 }
 
+#ifdef USB_REC
 /* ---------------------------------------------------------------- USB REC: the host's audio into a sample slot
  * HOME > USB REC: KNOB 3 turned right erases the slot, then waits for a sound and records it (until KNOB 3 is turned left,
  * or the slot is full); the sectors are written as they fill, the header last, so a cut leaves the slot empty, never
@@ -2231,6 +2271,7 @@ COLD static void urec_pump(void)                              /* (the main loop,
         if (urec_job(SLOT_AT[urec_slot], 0, sbuf + 8192, UREC_HEAD, 0)) urec_abort("REC: FLASH BUSY");
     }
 }
+#endif
 COLD static void mh_end(int i, uint32_t lat)
 {
     int t = mh[i].trk, n = mh[i].note;
@@ -3694,7 +3735,7 @@ COLD static void encoders(void)
             vis_style = (uint8_t)(((vis_style + d) % VIS_N + VIS_N) % VIS_N); vis_named = 25; continue;
         }
         if ((L & (1u << BTN_HOME)) && hold_step < 0) {          /* HOME: SELECT the sections, the knobs their settings */
-            if (e == ENC_SELECT) { layer_used = 1; home_sec = home_sec + d < 0 ? 0 : home_sec + d > 6 ? 6 : home_sec + d; continue; }
+            if (e == ENC_SELECT) { layer_used = 1; home_sec = home_sec + d < 0 ? 0 : home_sec + d > HOME_NSEC - 1 ? HOME_NSEC - 1 : home_sec + d; continue; }
             if (home_sec && kn >= 0) { layer_used = 1; home_knob(home_sec, kn, d); continue; }
             if (home_sec) continue;
         }
@@ -4473,7 +4514,9 @@ int app_main(uint32_t arg)
             int said = save_said, snd = saving_snd, eslot = ed_save_slot;
             save_said = 0; saving_snd = 0; ed_save_slot = -1;
             if (snd == 3) ed_job_done(said > 0);
+#ifdef USB_REC
             else if (snd == 5) urec_job_done(said > 0);       /* (USB REC: a sector, the header) */
+#endif
             else if (said > 0 && snd) say_imp(snd == 4 ? "FAVOURITES KEPT" : "USER SOUNDS SAVED");
             else if (eslot >= 0) {                       /* a project from the editor: opened once written */
                 if (said > 0) { load_project(0); say_imp("PROJECT RECEIVED"); } else say_bad("PROJECT NOT RECEIVED");
@@ -4488,7 +4531,9 @@ int app_main(uint32_t arg)
             }
             else { saved_crc = 0; save_retry = 0; say_bad("SAVE FAILED"); }
         }
+#ifdef USB_REC
         urec_pump();                                        /* (USB REC: the next sector, or the header) */
+#endif
         crumb_at(W_SCREEN);
         if (panel_step()) { led_dwell(); panel_dark(); ui_round(); }   /* (3.2: the frame's last column lit as long as the others) */
         else led_dwell();

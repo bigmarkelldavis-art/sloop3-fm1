@@ -685,10 +685,10 @@ GB_HOT void snd_mix(gb_sound *s, gb_bus *b, const gb_bus *other, int32_t *out)
      * the DJ filter, the limiter) takes it as it takes the tracks. Its level moves smoothly (no click on a change) */
     {
         float us = sm_step(&s->uin_lvl), ug = s->uin_lvl.cur;
-        if (s->uin_l && s->uin_r && (ug > 0.0f || us != 0.0f)) {
-            const float *il = s->uin_l, *ir = s->uin_r;
+        if (s->uin && (ug > 0.0f || us != 0.0f)) {
+            const float *il = s->uin;
             GB_UNROLL4
-            for (int n = 0; n < GB_BLOCK; n++) { ug += us; ml[n] += il[n] * ug; mr[n] += ir[n] * ug; }
+            for (int n = 0; n < GB_BLOCK; n++) { ug += us; float x = il[n] * ug; ml[n] += x; mr[n] += x; }
         }
         sm_end(&s->uin_lvl, us);
     }
