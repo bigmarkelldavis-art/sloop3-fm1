@@ -1,5 +1,11 @@
 name: Build firmware
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      usb_rec:
+        description: "Record USB audio into a sample slot (needs more RAM: may not fit)"
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -22,6 +28,8 @@ jobs:
         run: make test
 
       - name: Build the firmware and the installer page
+        env:
+          USB_REC: ${{ inputs.usb_rec && '1' || '' }}
         run: EDITOR_E2E=0 INSTALLER_E2E=0 sh fw/build.sh      # (sh: an upload through the web page drops the executable bit)
 
       - uses: actions/upload-artifact@v4
