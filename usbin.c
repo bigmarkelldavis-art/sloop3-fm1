@@ -66,3 +66,17 @@ int uin_pull(float *m, uint32_t n)
     else dry_blocks = 0;
     return 1;
 }
+
+uint32_t uin_drain(int16_t *d, uint32_t max, uint32_t keep)
+{
+    if (flush) { flush = 0; rd = w; locked = 0; dry_blocks = 0; last = 0.0f; }
+    if (!streaming) return 0;
+    uint32_t fill = uin_fill();
+    if (!locked) { if (fill < 200u) return 0; locked = 1; dry_blocks = 0; }
+    if (fill <= keep) return 0;
+    uint32_t n = fill - keep, r = rd;
+    if (n > max) n = max;
+    for (uint32_t i = 0; i < n; i++) { d[i] = ring[r]; r = r + 1u == UIN_N ? 0u : r + 1u; }
+    rd = (uint16_t)r;
+    return n;
+}

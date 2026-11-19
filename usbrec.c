@@ -4,12 +4,12 @@
 #include "usbrec.h"
 #include "../engine/sample.h"
 #if defined(__PI32V2__)
-#define XT __attribute__((section(".xtext.usbrec")))   /* what runs only while the flash window is on (the main loop's take handling): from the window, not the RAM */
+#define XT __attribute__((section(".xtext.usbrec")))   /* from the flash window, not the RAM: it runs only between the flash's jobs */
 #else
 #define XT
 #endif
 
-static uint32_t crc_upd(uint32_t crc, uint8_t b)            /* CRC-32 (IEEE, as store.c's crc32_ieee) one byte at a time */
+XT static uint32_t crc_upd(uint32_t crc, uint8_t b)         /* CRC-32 (IEEE, as store.c's crc32_ieee) one byte at a time */
 {
     crc = ~crc ^ b;
     for (int i = 0; i < 8; i++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
@@ -21,11 +21,12 @@ XT void urec_begin(usbrec *r, uint8_t *buf, uint32_t slot_size, int div)
     uint8_t *p = (uint8_t *)r;
     for (uint32_t i = 0; i < sizeof *r; i++) p[i] = 0;
     r->buf = buf; r->size = slot_size; r->div = (uint8_t)(div == 2 ? 2 : div == 4 ? 4 : 1);
+    r->sent = r->wr = UREC_DATA_AT;
     for (uint32_t i = 0; i < UREC_BUF; i++) buf[i] = 0xFF;
     r->on = 1;
 }
 
-static int encode(usbrec *r, int s)                          /* one sample (16 bits) to a code of 4 bits */
+XT static int encode(usbrec *r, int s)                       /* one sample (16 bits) to a code of 4 bits */
 {
     int diff = s - r->pred, code = 0;
     if (diff < 0) { code = 8; diff = -diff; }
@@ -47,7 +48,7 @@ static int encode(usbrec *r, int s)                          /* one sample (16 b
     return code;
 }
 
-static void put_byte(usbrec *r, uint8_t b)
+XT static void put_byte(usbrec *r, uint8_t b)
 {
     uint32_t abs = UREC_DATA_AT + r->bytes, sec = abs / UREC_SECTOR, at = abs % UREC_SECTOR, half = sec & 1u;
     if (at == 0 || r->bytes == 0) {                          /* a sector begins: its half must be free (written out) */
@@ -58,12 +59,10 @@ static void put_byte(usbrec *r, uint8_t b)
     r->buf[half * UREC_SECTOR + at] = b;
     r->crc = crc_upd(r->crc, b);
     r->bytes++;
-    uint32_t end = UREC_DATA_AT + r->bytes;
-    if (end % UREC_SECTOR == 0) r->ready = end / UREC_SECTOR;                 /* a sector is full */
-    if (end >= r->size) { r->full = 1; r->on = 0; if (end % UREC_SECTOR) r->ready = end / UREC_SECTOR + 1u; }
+    if (UREC_DATA_AT + r->bytes >= r->size) { r->full = 1; r->on = 0; }
 }
 
-static void put_sample(usbrec *r, int s)
+XT static void put_sample(usbrec *r, int s)
 {
     int code = encode(r, s);
     r->samples++;
@@ -71,48 +70,49 @@ static void put_sample(usbrec *r, int s)
     else { r->odd = 0; put_byte(r, (uint8_t)(r->lo | code << 4)); }
 }
 
-void urec_feed(usbrec *r, const float *l, const float *rt, uint32_t n)
+XT void urec_feed(usbrec *r, const int16_t *m, uint32_t n)
 {
-    if (!r->on) return;
-    if (!r->started) {
-        float pk = 0.0f;
-        for (uint32_t i = 0; i < n; i++) { float a = l[i] < 0 ? -l[i] : l[i], b = rt[i] < 0 ? -rt[i] : rt[i]; if (a > pk) pk = a; if (b > pk) pk = b; }
-        if (pk < UREC_THRESH) return;                        /* armed: waiting for the sound */
-        r->started = 1;
-    }
     for (uint32_t i = 0; i < n && r->on; i++) {
-        r->acc += 0.5f * (l[i] + rt[i]);
+        int v = m[i];
+        if (!r->started) { if (v < UREC_THRESH && v > -UREC_THRESH) continue; r->started = 1; }   /* armed: waiting for the sound */
+        r->acc += v;
         if (++r->cnt < r->div) continue;
-        float m = r->acc * (1.0f / (float)r->div) * 32767.0f;
-        r->acc = 0.0f; r->cnt = 0;
-        put_sample(r, (int)(m > 32767.0f ? 32767.0f : m < -32768.0f ? -32768.0f : m));
+        int mean = r->acc >> (r->div >> 1);                 /* (the mean of div samples: div is 1, 2 or 4) */
+        r->acc = 0; r->cnt = 0;
+        put_sample(r, mean);
     }
 }
 
 XT const uint8_t *urec_take(usbrec *r, uint32_t *sector, uint32_t *from, uint32_t *n)
 {
-    while (r->taken < r->ready) {
-        uint32_t sec = r->taken++, f = sec ? 0u : UREC_DATA_AT, last = UREC_DATA_AT + r->bytes;
-        uint32_t end = (sec + 1u) * UREC_SECTOR <= last ? UREC_SECTOR : last - sec * UREC_SECTOR;
-        if (end <= f) continue;                                                  /* (nothing in it) */
-        *sector = sec; *from = f; *n = end - f;
-        return r->buf + (sec & 1u) * UREC_SECTOR + f;
-    }
-    return 0;
+    uint32_t made = UREC_DATA_AT + r->bytes, page_end = (r->sent / UREC_PAGE + 1u) * UREC_PAGE;
+    if (made < page_end && !(r->stopped && made > r->sent)) return 0;       /* a page is not complete yet */
+    uint32_t end = made < page_end ? made : page_end;
+    if (end <= r->sent) return 0;
+    uint32_t sec = r->sent / UREC_SECTOR, f = r->sent % UREC_SECTOR;
+    *sector = sec; *from = f; *n = end - r->sent;
+    const uint8_t *d = r->buf + (sec & 1u) * UREC_SECTOR + f;
+    r->sent = end;
+    return d;
 }
 
-XT void urec_written(usbrec *r, uint32_t sector) { r->busy[sector & 1u] = 0; }
+XT void urec_written(usbrec *r, uint32_t n)
+{
+    r->wr += n;
+    if (r->wr % UREC_SECTOR == 0) r->busy[(r->wr / UREC_SECTOR - 1u) & 1u] = 0;       /* a sector complete: its half is free */
+    if (r->stopped && r->wr >= UREC_DATA_AT + r->bytes) r->busy[0] = r->busy[1] = 0;
+}
 
 XT uint32_t urec_stop(usbrec *r)
 {
     if (r->odd) { r->odd = 0; put_byte(r, r->lo); }          /* (the last sample alone: its byte's high nibble 0) */
-    r->on = 0;
-    uint32_t end = UREC_DATA_AT + r->bytes;
-    if (r->bytes && (end % UREC_SECTOR) && r->ready < end / UREC_SECTOR + 1u) r->ready = end / UREC_SECTOR + 1u;
+    r->on = 0; r->stopped = 1;
     return r->bytes ? r->samples : 0u;
 }
 
-static void w32(uint8_t *b, uint32_t v) { b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); b[2] = (uint8_t)(v >> 16); b[3] = (uint8_t)(v >> 24); }
+XT int urec_idle(const usbrec *r) { return r->wr >= UREC_DATA_AT + r->bytes && r->sent == r->wr; }
+
+XT static void w32(uint8_t *b, uint32_t v) { b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); b[2] = (uint8_t)(v >> 16); b[3] = (uint8_t)(v >> 24); }
 XT void urec_header(const usbrec *r, uint8_t *h, const char *name)
 {
     for (uint32_t i = 0; i < UREC_HEAD; i++) h[i] = 0;

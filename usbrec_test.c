@@ -19,19 +19,21 @@ static int fails;
 static uint8_t flash[SMP_USR_SIZE], buf[UREC_BUF];
 static int sectors_seen[SMP_USR_SIZE / 4096];
 
-/* the flash's side: every sector handed out is written; `lag` blocks pass before it counts as written */
-static void pump(usbrec *r, int *lag_q, int lag, uint32_t *queue, int *qn)
+/* the flash's side: one piece (a page) at a time, as the firmware's flash jobs are: it is handed out, and `lag` feeds later it
+ * counts as written (the next is asked for only then) */
+typedef struct { int busy, left; uint32_t n; } flash_job;
+static void pump(usbrec *r, flash_job *j, int lag)
 {
     uint32_t sec, from, n; const uint8_t *d;
-    while ((d = urec_take(r, &sec, &from, &n)) != 0) {
-        CHECK(sec < SMP_USR_SIZE / 4096 && from + n <= 4096, "bad sector %u %u %u", sec, from, n);
+    if (j->busy && --j->left <= 0) { urec_written(r, j->n); j->busy = 0; }
+    if (j->busy) return;
+    if ((d = urec_take(r, &sec, &from, &n)) != 0) {
+        CHECK(sec < SMP_USR_SIZE / 4096 && from + n <= 4096 && n <= 256, "bad piece %u %u %u", sec, from, n);
         if (sec >= SMP_USR_SIZE / 4096) return;
-        memcpy(flash + sec * 4096 + from, d, n);
+        for (uint32_t i = 0; i < n; i++) CHECK(flash[sec * 4096 + from + i] == 0xFF || flash[sec * 4096 + from + i] == d[i], "written over (not erased)");
+        memcpy(flash + sec * 4096 + from, d, n);                     /* (a flash only clears bits: a page programmed once) */
         sectors_seen[sec]++;
-        queue[(*qn)++] = sec; lag_q[sec & 1] = lag;
-    }
-    for (int i = 0; i < *qn; ) {                            /* a sector written once its lag has passed */
-        if (lag_q[queue[i] & 1]-- <= 0) { urec_written(r, queue[i]); memmove(queue + i, queue + i + 1, (size_t)(*qn - i - 1) * 4u); (*qn)--; } else i++;
+        j->busy = 1; j->left = lag; j->n = n;
     }
 }
 
@@ -53,35 +55,35 @@ static int decode(const uint8_t *slot, int16_t *out, uint32_t n)       /* the SA
 
 static void take(int div, double secs, double tone, int lead_quiet_blocks, int lag, uint32_t *samples, double *snr_db, int expect_full)
 {
-    usbrec r; uint32_t queue[8]; int qn = 0, lag_q[2] = { 0, 0 };
+    usbrec r; flash_job job = { 0, 0, 0 };
     memset(flash, 0xFF, sizeof flash); memset(sectors_seen, 0, sizeof sectors_seen);
     urec_begin(&r, buf, SMP_USR_SIZE, div);
     float l[64], rr[64]; double ph = 0; long blocks = (long)(secs * 44117.647 / 64.0);
-    double *ref = malloc(sizeof(double) * (size_t)(blocks * 64 + 64)); long nref = 0;
+    double *ref = malloc(sizeof(double) * (size_t)(blocks * 64 + 64)); long nref = 0; int st = 0, cc = 0; double carry = 0;
     for (long b = 0; b < blocks && r.on; b++) {
         for (int i = 0; i < 64; i++) {
             float v = b < lead_quiet_blocks ? 0.0005f * (float)sin(ph) : (float)(0.5 * sin(ph));
             ph += 2.0 * M_PI * tone / 44117.647; l[i] = rr[i] = v;
         }
-        int was = r.started;
-        urec_feed(&r, l, rr, 64);
-        if (r.started) {                                    /* the reference: what was fed from the first loud block, decimated */
-            int from = was ? 0 : 0;
-            double acc = 0; int c = 0; static double carry; static int cc;
-            if (!was) { carry = 0; cc = 0; }
-            (void)from; (void)acc; (void)c;
-            for (int i = 0; i < 64; i++) { carry += l[i]; if (++cc == div) { ref[nref++] = carry / div; carry = 0; cc = 0; } }
+        int16_t q[64]; for (int i = 0; i < 64; i++) q[i] = (int16_t)(l[i] * 32767.0f);
+        /* the reference: what is fed from the first sample past the threshold on, decimated (the mean of div samples) */
+        for (int i = 0; i < 64; i++) {
+            if (!st && q[i] < UREC_THRESH && q[i] > -UREC_THRESH) continue;
+            st = 1; carry += q[i]; if (++cc == div) { ref[nref++] = carry / div / 32767.0; carry = 0; cc = 0; }
         }
-        pump(&r, lag_q, lag, queue, &qn);
+        urec_feed(&r, q, 64);
+        pump(&r, &job, lag);
     }
     CHECK(r.err == 0, "an overrun with lag %d", lag);
+    if (expect_full && nref > (long)r.samples) nref = (long)r.samples;      /* (the block that filled the slot: the rest of it was not taken) */
     *samples = urec_stop(&r);
-    for (int k = 0; k < 4; k++) pump(&r, lag_q, 0, queue, &qn), pump(&r, lag_q, 0, queue, &qn);
+    for (int k = 0; k < 400 && !urec_idle(&r); k++) pump(&r, &job, 0);
+    CHECK(urec_idle(&r), "not every byte written");
     CHECK(r.full == (uint8_t)expect_full, "full = %d, wanted %d", r.full, expect_full);
     uint8_t h[UREC_HEAD]; urec_header(&r, h, "USB REC"); memcpy(flash, h, UREC_HEAD);
     /* every sector that holds data was handed out once, in full */
     uint32_t last = (512u + r.bytes + 4095u) / 4096u;
-    for (uint32_t s = 0; s < last; s++) CHECK(sectors_seen[s] == 1, "sector %u written %d times", s, sectors_seen[s]);
+    for (uint32_t s = 0; s < last; s++) CHECK(sectors_seen[s] >= 1, "sector %u never written", s);
     /* the firmware's reader accepts it */
     CHECK(smp_user_head_ok(flash) == 1, "the header is refused");
     smp_user_scan(0, flash);
@@ -116,11 +118,12 @@ int main(void)
       printf("full: %u samples (room %u ms)\n", n, 0u); CHECK(n == 2u * (SMP_USR_SIZE - 512u), "full: %u", n); CHECK(snr > 25.0, "SNR when full %.1f", snr); }
     { usbrec r; urec_begin(&r, buf, SMP_USR_SIZE, 1);               /* a flash that never writes: the third sector finds its half busy */
       float l[64]; for (int i = 0; i < 64; i++) l[i] = 0.5f * (float)sin(i * 0.3);
+      int16_t q[64]; for (int i = 0; i < 64; i++) q[i] = (int16_t)(l[i] * 32767.0f);
       uint32_t sec, from, n; int got = 0;
-      for (int b = 0; b < 400 && r.on; b++) { urec_feed(&r, l, l, 64); while (urec_take(&r, &sec, &from, &n)) got++; }
-      CHECK(r.err == UREC_ERR_OVERRUN && got == 2, "overrun: err %d, sectors %d", r.err, got); }
+      for (int b = 0; b < 400 && r.on; b++) { urec_feed(&r, q, 64); const uint8_t *d; while ((d = urec_take(&r, &sec, &from, &n)) != 0) got++; }   /* (taken, never written) */
+      CHECK(r.err == UREC_ERR_OVERRUN, "overrun: err %d (pieces %d)", r.err, got); }
     { usbrec r; urec_begin(&r, buf, SMP_USR_SIZE, 1);               /* nothing loud: nothing kept */
-      float l[64] = { 0 }; for (int b = 0; b < 50; b++) urec_feed(&r, l, l, 64);
+      int16_t l[64] = { 0 }; for (int b = 0; b < 50; b++) urec_feed(&r, l, 64);
       CHECK(urec_stop(&r) == 0, "something recorded from silence"); }
     printf(fails ? "usbrec_test: FAILED (%d)\n" : "usbrec_test: ok\n", fails);
     return fails != 0;

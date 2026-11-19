@@ -20,13 +20,14 @@ DJ filter and the limiter work on it like on a track. The settings are kept with
 
 ## USB REC (off in the default build)
 
-The firmware's RAM is almost full, so recording the incoming audio into a sample slot is behind a build flag:
-`USB_REC=1 sh fw/build.sh`. With it HOME gets a page 6 (**USB REC 6/6**): `SLOT` (USR1-4), `LENGTH` (3.7 s, 7.4 s or
-14.8 s) and `REC` (KNOB 3 right to start, left to stop). REC erases the slot (its old sample is lost), says `READY, PLAY
-NOW`, waits for a sound (-50 dBFS) and records until you stop it or the slot is full. The sectors are written as they fill
-and the header last: a cut leaves the slot empty, never half a sample. The take is mono IMA ADPCM in the slot's "FSMP"
-layout, so SAMPLE, SLICE and YOUR KITS play it. It needs a few KB more RAM than the default build has: it is tested on
-the PC twin (`make build/twin`, built with `-DUSB_REC`) but may not link for the FM-1 until more RAM is found.
+Recording the incoming audio into a sample slot is behind a build flag: `USB_REC=1 sh fw/build.sh` (or the checkbox in the
+GitHub workflow). With it HOME gets a page 6 (**USB REC 6/6**): `SLOT` (USR1-4), `LENGTH` (3.7 s, 7.4 s or 14.8 s) and `REC`
+(KNOB 3 right to start, left to stop). REC erases the slot (its old sample is lost), says `READY, PLAY NOW`, waits for a
+sound (-50 dBFS) and records until you stop it or the slot is full. **While it records, the incoming audio is not heard**
+(the main loop takes it from the USB ring to encode it). The flash is written a page at a time as the take goes, and the
+header last: a cut leaves the slot empty, never half a sample. The take is mono IMA ADPCM in the slot's "FSMP" layout, so
+SAMPLE, SLICE and YOUR KITS play it. The recorder's code runs from the flash window, not the RAM (which is nearly full), and
+the USB ring (10 ms) holds the audio while the flash writes a page (about a millisecond).
 
 ## What changed
 
@@ -37,7 +38,7 @@ the PC twin (`make build/twin`, built with `-DUSB_REC`) but may not link for the
 | `engine/sound.c`, `engine.h` | the USB IN bus: dry into the mix, before the master bus |
 | `app/store.c` | the CRC-32 by nibbles (a 64-byte table) instead of a 1 KB table in RAM: the room for the above. Same results. |
 | `fw/main.c` | the HOME page, the pull each block (into usb_l's block, which snd_mix writes only after reading it), the settings; with `USB_REC` the recorder |
-| `app/usbrec.[ch]` | (USB_REC) the recorder: ADPCM encoder (the SAMPLE engine's decoder inverted), the sector buffers, the slot header |
+| `app/usbrec.[ch]` | (USB_REC) the recorder: ADPCM encoder (the SAMPLE engine's decoder inverted), the sector buffers, the slot header; all from the flash window |
 | `tests/usbin_test.c`, `tests/usbrec_test.c`, `host/twin.c` (`usbin`, `usbrec`) | the tests |
 
 ## Known limits

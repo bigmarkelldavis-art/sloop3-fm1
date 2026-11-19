@@ -29,3 +29,6 @@ void uin_stream(int on);                    /* the host's alternate setting: 1 s
 int uin_active(void);                       /* streaming and locked (frames are coming through) */
 uint32_t uin_fill(void);                    /* frames in the ring */
 uint32_t uin_lost(void);                    /* frames dropped (a full ring) + frames missing (an empty one), since reset */
+/* for USB REC (usbrec.h), from the main loop in place of uin_pull while a take runs: up to max samples, leaving `keep` in the
+ * ring (the conversion steers to a fill of UIN_TARGET: draining below it would make it speed up). Returns the count. */
+uint32_t uin_drain(int16_t *d, uint32_t max, uint32_t keep);

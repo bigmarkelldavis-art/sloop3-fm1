@@ -2048,6 +2048,8 @@ static void sc_usbrec(void)                   /* USB AUDIO IN: a host plays to t
     EXPECT(smp_user_nz(1) == 1, "REC: USR2 empty after the take");
     const smp_zone *z = smp_zone_of(SMP_USR | 1u << 5);
     printf("[%8.3f]    REC kept: %u samples, rate %u\n", tw_s(), z->n, z->rate);
+    printf("[%8.3f]    USB IN ring: %u frames lost since the stream began\n", tw_s(), uin_lost());
+    EXPECT(uin_lost() < 400u, "the USB ring lost %u frames during the take (flash pages, the main loop)", uin_lost());
     EXPECT(z->n > 40000u && z->n < 80000u && z->rate == 32768u, "REC: the zone (%u samples, rate %u)", z->n, z->rate);
     /* the flash holds a sine of 440 Hz (at half the rate: 220.5 samples a period) */
     const uint8_t *w = (const uint8_t *)(FLASH_WIN + SLOT_AT[1] - 0x4000u);
@@ -2235,7 +2237,8 @@ static const struct { const char *name; void (*fn)(void); } SC[] = {
     { "boot", sc_boot }, { "reboot", sc_reboot }, { "sounds", sc_sounds }, { "ukit", sc_ukit }, { "usbin", sc_usbin },
 #ifdef USB_REC
     { "usbrec", sc_usbrec },
-#endif { "pages", sc_pages }, { "record", sc_record },
+#endif
+    { "pages", sc_pages }, { "record", sc_record },
     { "powercut", sc_powercut }, { "aftercut", sc_after_cut }, { "sample", sc_sample }, { "editor", sc_editor },
     { "monkey", sc_monkey }, { "import", sc_import }, { "midi", sc_midi }, { "rescue", sc_rescue }, { "calib", sc_calib }, { "settings", sc_settings }, { "play", sc_play }, { "levels", sc_levels }, { "mixui", sc_mixui }, { "fx", sc_fx }, { "editor2", sc_editor2 }, { "serve", sc_serve }, { "vis", sc_vis }, { "banksave", sc_banksave }, { "punch", sc_punch }, { "film", sc_film }, { "inst", sc_inst }, { "film2", sc_film2 }, { "bigproj", sc_bigproj }, { "bigcut", sc_bigcut }, { "punch2", sc_punch2 }, { "crumb", sc_crumb }, { "nan", sc_nan } };
 static void (*tw_sc)(void);

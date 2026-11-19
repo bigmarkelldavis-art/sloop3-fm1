@@ -475,7 +475,7 @@ enum { UR_IDLE, UR_ERASE, UR_REC, UR_END, UR_HEAD };           /* the take: the 
 #ifdef USB_REC
 static uint8_t urec_slot, urec_div;                            /* REC's slot 0..3 and rate 0..2 (all, half, quarter) */
 static uint8_t ur_st, ur_e;                                    /* the take's state; the sector being erased */
-static uint32_t ur_sec;                                        /* the sector being written */
+static uint32_t ur_n;                                          /* the bytes of the piece (a page) being written */
 static usbrec ur_r;
 COLD static void urec_start(void);
 COLD static void urec_stop_user(void);
@@ -561,16 +561,9 @@ __attribute__((noinline)) static void render_block(int32_t *out)
     } else S.grid = -1.0f;
     for (int t = 0; t < SEQ_NTRK && t < GB_NTRACK; t++) { int w = Q.swing + Q.t[t].swing; S.trk[t].swing = (uint8_t)(w > 100 ? 100 : w); }
     /* USB AUDIO IN: this block of what the host plays (mono, at our rate; it borrows usb_l, the USB FULL capture's block,
-     * which snd_mix writes after it has read this); mixed in by snd_mix, and kept while a take runs */
-#ifdef USB_REC
-    if (uin_on || ur_st == UR_REC) {
-        int act = uin_pull(S.usb_l, GB_BLOCK);
-        S.uin = act && uin_on ? S.usb_l : 0;
-        if (act && ur_st == UR_REC) urec_feed(&ur_r, S.usb_l, S.usb_l, GB_BLOCK);
-    } else S.uin = 0;
-#else
-    S.uin = uin_on && uin_pull(S.usb_l, GB_BLOCK) ? S.usb_l : 0;
-#endif
+     * which snd_mix writes only after it has read this); mixed in by snd_mix. While a take runs (USB REC) the main loop
+     * takes the audio from the ring instead: it is not heard then. */
+    S.uin = uin_on && ur_st != UR_REC && uin_pull(S.usb_l, GB_BLOCK) ? S.usb_l : 0;
     crumb_at(W_VOICES);
     if (two && hs[HS_CORE2] && cpu1_run(job_voices, 0)) {
         snd_render_voices(&S, &busA, 0, 2);
@@ -2193,9 +2186,11 @@ static int ed_job(uint32_t sector, uint32_t off, const uint8_t *d, uint32_t n, i
 #ifdef USB_REC
 /* ---------------------------------------------------------------- USB REC: the host's audio into a sample slot
  * HOME > USB REC: KNOB 3 turned right erases the slot, then waits for a sound and records it (until KNOB 3 is turned left,
- * or the slot is full); the sectors are written as they fill, the header last, so a cut leaves the slot empty, never
- * half a sample. While the flash works the screen waits and the samples read from the flash are silent (as in a save).
- * (app/usbrec.c encodes; the flash jobs are the editor's: store_raw_begin, one at a time, saving_snd 5 on completion.) */
+ * or the slot is full); the pieces (pages) are written as they fill, the header last, so a cut leaves the slot empty, never
+ * half a sample. While a take runs the incoming audio is not mixed in: the main loop takes it from the USB ring and encodes
+ * it (app/usbrec.c: all from the flash window, so no RAM). The flash works a page at a time, about a millisecond, and the
+ * ring (10 ms) holds the audio meanwhile; while it works the screen waits and the samples read from the flash are silent.
+ * (The flash jobs are the editor's: store_raw_begin, one at a time, saving_snd 5 on completion.) */
 static int urec_job(uint32_t at, uint32_t off, const uint8_t *d, uint32_t n, int erase)
 {
     if (store_raw_begin(at, off, d, n, erase)) return -1;
@@ -2240,10 +2235,10 @@ COLD static void urec_job_done(int ok)                        /* a flash job of 
             if (urec_job(SLOT_AT[urec_slot] + ur_e * 4096u, 0, sbuf, 0, 1)) urec_abort("REC: FLASH BUSY");
             return;
         }
-        ur_st = UR_REC; say_imp("REC: READY, PLAY NOW");
+        uin_reset(); ur_st = UR_REC; say_imp("REC: READY, PLAY NOW");
         return;
     }
-    if (ur_st == UR_REC || ur_st == UR_END) { urec_written(&ur_r, ur_sec); return; }
+    if (ur_st == UR_REC || ur_st == UR_END) { urec_written(&ur_r, ur_n); return; }
     if (ur_st == UR_HEAD) {                                   /* the header is in: the slot is there */
         ur_st = UR_IDLE; sbuf_used();
         smp_user_scan(urec_slot, (const uint8_t *)(uintptr_t)(FLASH_WIN + SLOT_AT[urec_slot] - 0x4000u));
@@ -2253,17 +2248,22 @@ COLD static void urec_job_done(int ok)                        /* a flash job of 
         } else say_bad("REC: BAD SLOT");
     }
 }
-COLD static void urec_pump(void)                              /* (the main loop, each time round) the take's next flash job */
+COLD static void urec_pump(void)                              /* (the main loop, each time round the flash window is on) */
 {
-    if (ur_st < UR_REC || saving) return;
+    if (ur_st < UR_REC) return;
+    if (ur_st == UR_REC) {                                    /* the incoming audio, taken from the ring (above its target fill) */
+        int16_t t[128]; uint32_t n;
+        while (ur_r.on && (n = uin_drain(t, 128, UIN_TARGET)) > 0) urec_feed(&ur_r, t, n);
+    }
+    if (saving) return;
     if (ur_st == UR_REC && (ur_r.err || ur_r.full)) { urec_finish(); if (ur_st == UR_IDLE) return; }
     uint32_t sec, from, n; const uint8_t *d = urec_take(&ur_r, &sec, &from, &n);
     if (d) {
-        ur_sec = sec;
+        ur_n = n;
         if (urec_job(SLOT_AT[urec_slot] + sec * 4096u, from, d, n, 0)) urec_abort("REC: FLASH BUSY");
         return;
     }
-    if (ur_st == UR_END) {                                    /* every sector written (no job under way): the header */
+    if (ur_st == UR_END && urec_idle(&ur_r)) {                /* every byte written (no job under way): the header */
         if (!ur_r.samples) { ur_st = UR_IDLE; sbuf_used(); say("REC: NOTHING RECORDED"); return; }
         static const char NM[] = "USB REC";
         urec_header(&ur_r, sbuf + 8192, NM);
